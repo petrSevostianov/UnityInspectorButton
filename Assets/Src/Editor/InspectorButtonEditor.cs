@@ -1,48 +1,114 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Linq;
 using System.Reflection;
 using UnityEditor;
 using UnityEngine;
+#nullable enable
+public abstract class ButtonDrawerBase : PropertyDrawer {
+    protected abstract bool ValidateMethod(MethodInfo method);
 
-[CustomPropertyDrawer(typeof(InspectorButton))]
-public class InspectorButtonDrawer : PropertyDrawer {
+    protected abstract void InvokeMethod(object target, MethodInfo method);
 
-    public override bool CanCacheInspectorGUI(SerializedProperty property) {
-        return true;
+    public override float GetPropertyHeight(SerializedProperty property, GUIContent label) {
+        return EditorGUIUtility.singleLineHeight;
     }
 
-    public override void OnGUI(Rect position, SerializedProperty property, GUIContent label) {
-        var targets = property.serializedObject.targetObjects;
-        if (targets == null || targets.Length == 0)
+    private Action? delayedAction;
+    public void invokeDelayedAction() {
+        delayedAction?.Invoke();
+        delayedAction = null;
+
+    }
+
+    public override void OnGUI(Rect pos, SerializedProperty prop, GUIContent label) {
+        SerializedObject O = (prop.GetType().GetField("m_SerializedObject", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(prop) as SerializedObject)!;
+        var TargetObjects = O.targetObjects;
+
+        string MethodName = prop.name;
+        char[] charsToTrim = { '_' };
+        MethodName = MethodName.Trim(charsToTrim);
+        MethodInfo TargetMethod = TargetObjects[0].GetType().GetMethods()
+            .Where(ValidateMethod)
+            .FirstOrDefault(x => x.Name == MethodName);
+
+        if (TargetMethod == null) {
+            GUI.color = Color.red;
+            GUI.Label(pos, "Method " + MethodName + " not found.");
+            GUI.color = Color.white;
             return;
-
-        var methodName = property.name.TrimStart('_');
-        var declaringType = this.fieldInfo.DeclaringType;
-        var targetMethods = new List<MethodInfo>(targets.Length);
-        foreach (var target in targets) {
-            var targetMethod = declaringType.GetMethod(methodName,
-                    BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-
-            if (targetMethod != null)
-                targetMethods.Add(targetMethod);
         }
 
-        if (targetMethods.Count != targets.Length) {
-            var msg = string.Format("Method '{0}' not found", methodName);
-            EditorGUI.HelpBox(position, msg, MessageType.Error);
-            return;
+        if (GUI.Button(pos, ObjectNames.NicifyVariableName(MethodName))) {
+            delayedAction = () => {
+                foreach (var o in TargetObjects) {
+                    InvokeMethod(o, TargetMethod);
+                }
+            };
+            EditorApplication.delayCall += invokeDelayedAction;
+        }
+    }
+}
+
+[CustomPropertyDrawer(typeof(InspectorButton))]
+public class InspectorButtonDrawer : ButtonDrawerBase {
+    protected override bool ValidateMethod(MethodInfo method) {
+        return method.ReturnType == typeof(void) && method.GetParameters().Length == 0;
+    }
+
+    protected override void InvokeMethod(object target, MethodInfo method) {
+        method.Invoke(target, null);
+    }
+}
+
+
+[AttributeUsage(AttributeTargets.Method)]
+public class InspectorFileDialogButtonInfoAttribute : Attribute {
+    public enum FileDialogType {
+        Open,
+        Save,
+
+    }
+
+    public FileDialogType DialogType { get; } = FileDialogType.Open;
+    public string? Title { get; }
+    public string Extension { get; }
+    public InspectorFileDialogButtonInfoAttribute(string extension, string? title = null, FileDialogType dialogType = FileDialogType.Open) {
+        DialogType = dialogType;
+        Extension = extension;
+        Title = title;
+    }
+}
+
+
+[CustomPropertyDrawer(typeof(InspectorFileSelectButton))]
+public class InspectorFileDialogButtonDrawer : ButtonDrawerBase {
+    protected override bool ValidateMethod(MethodInfo method) {
+        return method.ReturnType == typeof(void) &&
+               method.GetParameters().Length == 1 &&
+               method.GetParameters().FirstOrDefault()?.ParameterType == typeof(string);
+    }
+
+    protected override void InvokeMethod(object target, MethodInfo method) {
+        var extensionAttribute = method.GetCustomAttribute<InspectorFileDialogButtonInfoAttribute>(false);
+        string? extension = extensionAttribute?.Extension;
+        string? title = extensionAttribute?.Title;
+        var dialogType = extensionAttribute?.DialogType ?? InspectorFileDialogButtonInfoAttribute.FileDialogType.Open;
+        if (title == null) {
+            title = ObjectNames.NicifyVariableName(method.Name);
         }
 
-        position.xMin += EditorGUIUtility.labelWidth;
+        string path = "";
+        switch (dialogType) {
+            case InspectorFileDialogButtonInfoAttribute.FileDialogType.Open:
+                path = EditorUtility.OpenFilePanel(title, "", extension);
+                break;
+            case InspectorFileDialogButtonInfoAttribute.FileDialogType.Save:
+                path = EditorUtility.SaveFilePanel(title, "", "", extension);
+                break;
+        }
 
-        var nicerName = ObjectNames.NicifyVariableName(methodName);
-        if (GUI.Button(position, nicerName)) {
-            for (int i = 0; i < targets.Length; i++) {
-                targetMethods[i].Invoke(targets[i], null);
-            }
-
-            // In most use cases it's handy to repaint gizmos after
-            // the button clicked.
-            SceneView.RepaintAll();
+        if (!string.IsNullOrEmpty(path)) {
+            method.Invoke(target, new object[] { path });
         }
     }
 }
